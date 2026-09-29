@@ -34,6 +34,7 @@ class AniDmWindow(Adw.ApplicationWindow):
     def __init__(self, app):
         super().__init__(application=app, title="Ani-dm")
         self.set_default_size(1000, 700)
+        self._cover_size = (COVER_W, COVER_H)
         self.connect("notify::default-width", self._on_resize)
 
         COVER_CACHE.mkdir(parents=True, exist_ok=True)
@@ -53,8 +54,8 @@ class AniDmWindow(Adw.ApplicationWindow):
         self.results.set_selection_mode(Gtk.SelectionMode.NONE)
         self.results.set_valign(Gtk.Align.START)
         self.results.set_homogeneous(True)
-        self.results.set_column_spacing(0)
-        self.results.set_row_spacing(0)
+        self.results.set_column_spacing(12)
+        self.results.set_row_spacing(12)
         self.results.set_min_children_per_line(2)
         self.results.set_max_children_per_line(999)
         self.results.connect("child-activated", self._on_child_activated)
@@ -87,12 +88,9 @@ class AniDmWindow(Adw.ApplicationWindow):
 
     def _compute_cover_size(self):
         container_width = self.get_width() or self.get_default_size()[0]
-        if container_width / COVER_W != container_width // COVER_W:
-            nb = container_width // COVER_W + 1
-            width = container_width // nb
-        else:
-            width = COVER_W
-        width -= COVER_MARGIN * 2
+        tile = COVER_W + COVER_MARGIN * 2
+        nb = max(2, container_width // tile)
+        width = (container_width // nb) - COVER_MARGIN * 2
         height = (width * COVER_H) // COVER_W
         self._cover_size = (int(width), int(height))
 
@@ -138,10 +136,6 @@ class AniDmWindow(Adw.ApplicationWindow):
         cover_wrap.set_overflow(Gtk.Overflow.HIDDEN)
         cover_wrap.set_size_request(w, h)
         cover_wrap.set_halign(Gtk.Align.CENTER)
-        cover_wrap.set_margin_start(COVER_MARGIN)
-        cover_wrap.set_margin_end(COVER_MARGIN)
-        cover_wrap.set_margin_top(COVER_MARGIN)
-        cover_wrap.set_margin_bottom(COVER_MARGIN)
         cover_wrap.append(picture)
 
         title = Gtk.Label(label=info.title)
@@ -155,6 +149,7 @@ class AniDmWindow(Adw.ApplicationWindow):
         title.set_size_request(-1, 40)
 
         card = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=6)
+        card.set_hexpand(True)
         card.append(cover_wrap)
         card.append(title)
         card.info = info
@@ -286,7 +281,6 @@ class EpisodePage(Adw.NavigationPage):
         title_main.add_css_class("title-1")
         title_main.set_wrap(True)
         title_main.set_xalign(0)
-        title_main.set_xalign(0)
         titles.append(title_main)
 
         if info.romaji and info.romaji != (info.english or ""):
@@ -295,7 +289,7 @@ class EpisodePage(Adw.NavigationPage):
             title_sub.set_wrap(True)
             title_sub.set_xalign(0)
             titles.append(title_sub)
-        
+
         meta_bits = []
         if info.format:
             meta_bits.append(info.format)
@@ -336,7 +330,6 @@ class EpisodePage(Adw.NavigationPage):
         detail_row.append(cover)
         detail_row.append(titles)
 
-        full_summary = self._clean_summary(info.description)
         self._summary_expanded = False
 
         summary_child = Gtk.Label(hexpand=True, xalign=0, wrap=True,
@@ -576,6 +569,7 @@ class EpisodePage(Adw.NavigationPage):
         active = button.get_active()
         self.more_btn.set_label("Show Less" if active else "Show More")
         self.synopsis.set_revealed(active)
+
 
 class PickerPage(Adw.NavigationPage):
     def __init__(self, window, info, episode_page):
