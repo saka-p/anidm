@@ -2,6 +2,8 @@ import threading
 import gi
 import re
 import html
+import math
+import cairo
 
 gi.require_version("Gtk", "4.0")
 gi.require_version("Adw", "1")
@@ -9,13 +11,14 @@ gi.require_version("Adw", "1")
 from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 from difflib import SequenceMatcher
-from gi.repository import Adw, Gtk, Gdk, GLib, Pango, GdkPixbuf, GObject
+from gi.repository import Adw, Gtk, Gdk, Gio, GLib, Pango, GdkPixbuf, GObject
 from curl_cffi import requests
 
 from . import flaresolverr
 from .metadata.anilist import AniListClient
 from .backends.animepahe import AnimepaheBackend, LIBRARY_DIR
 from .synopsis_fading import SynopsisFading
+from .downloads import DownloadManager, Status
 
 COVER_CACHE = Path.home() / ".cache" / "ani-dm" / "covers"
 COVER_W, COVER_H = 140, 199
@@ -28,6 +31,33 @@ def _norm(s):
 
 def _similar(a, b):
     return SequenceMatcher(None, _norm(a), _norm(b)).ratio()
+
+
+class ProgressRing(Gtk.DrawingArea):
+    def __init__(self, size=40):
+        super().__init__()
+        self._fraction = 0.0
+        self.set_content_width(size)
+        self.set_content_height(size)
+        self.set_draw_func(self._draw)
+
+    def set_fraction(self, fraction):
+        self._fraction = max(0.0, min(1.0, fraction))
+        self.queue_draw()
+
+    def _draw(self, _area, cr, width, height, *_):
+        cx, cy = width / 2, height / 2
+        radius = min(cx, cy) - 3
+        cr.set_line_width(4)
+        cr.set_line_cap(cairo.LINE_CAP_ROUND)
+        cr.set_source_rgba(1, 1, 1, 0.2)
+        cr.arc(cx, cy, radius, 0, 2 * math.pi)
+        cr.stroke()
+        if self._fraction > 0:
+            cr.set_source_rgb(0.21, 0.52, 0.89)
+            start = -math.pi / 2
+            cr.arc(cx, cy, radius, start, start + 2 * math.pi * self._fraction)
+            cr.stroke()
 
 
 class AniDmWindow(Adw.ApplicationWindow):
@@ -43,6 +73,14 @@ class AniDmWindow(Adw.ApplicationWindow):
         self.backend = AnimepaheBackend()
         threading.Thread(target=self.backend.warm_clearance, daemon=True).start()
         self.cover_pool = ThreadPoolExecutor(max_workers=4)
+        self._dl_toast = None
+        self._dl_user_dismissed = False
+        self._queue_btns = []
+        self.manager = DownloadManager(
+            self.backend, LIBRARY_DIR,
+            on_change=lambda: GLib.idle_add(self._refresh_downloads),
+        )
+        self.skip_delete_confirm = False
 
         self.search_entry = Gtk.SearchEntry()
         self.search_entry.set_placeholder_text("Search anime…")
@@ -73,8 +111,11 @@ class AniDmWindow(Adw.ApplicationWindow):
         box.append(self.spinner)
         box.append(scroller)
 
+        search_header = Adw.HeaderBar()
+        search_header.pack_start(self._make_queue_btn())
+
         search_toolbar = Adw.ToolbarView()
-        search_toolbar.add_top_bar(Adw.HeaderBar())
+        search_toolbar.add_top_bar(search_header)
         search_toolbar.set_content(box)
 
         search_page = Adw.NavigationPage(child=search_toolbar, title="Search")
@@ -85,6 +126,39 @@ class AniDmWindow(Adw.ApplicationWindow):
         self.toasts = Adw.ToastOverlay()
         self.toasts.set_child(self.navview)
         self.set_content(self.toasts)
+
+    def _make_queue_btn(self):
+        btn = Gtk.Button()
+        btn.add_css_class("flat")
+        btn.set_tooltip_text("Show downloads")
+
+        spinner = Gtk.Spinner()
+        pause_icon = Gtk.Image(icon_name="media-playback-pause-symbolic")
+        stack = Gtk.Stack()
+        stack.add_named(spinner, "busy")
+        stack.add_named(pause_icon, "paused")
+        btn.set_child(stack)
+
+        btn.set_visible(False)
+        btn.connect("clicked", self._on_queue_btn)
+        btn._spinner = spinner
+        btn._stack = stack
+        self._queue_btns.append(btn)
+        return btn
+
+    def _set_queue_btns_visible(self, visible, paused=False):
+        for btn in self._queue_btns:
+            btn.set_visible(visible)
+            if visible and not paused:
+                btn._stack.set_visible_child_name("busy")
+                btn._spinner.start()
+            else:
+                btn._spinner.stop()
+                btn._stack.set_visible_child_name("paused")
+
+    def _on_queue_btn(self, _btn):
+        self._dl_user_dismissed = False
+        self._refresh_downloads()
 
     def _compute_cover_size(self):
         container_width = self.get_width() or self.get_default_size()[0]
@@ -97,6 +171,7 @@ class AniDmWindow(Adw.ApplicationWindow):
     def _on_child_activated(self, _flowbox, child):
         info = child.get_child().info
         self.navview.push(EpisodePage(self, info))
+        self._refresh_downloads()
 
     def _on_search(self, entry):
         query = entry.get_text().strip()
@@ -217,6 +292,103 @@ class AniDmWindow(Adw.ApplicationWindow):
             return False
         GLib.idle_add(do_resize)
 
+    def _build_dl_toast(self):
+        self._dl_ring = ProgressRing(size=40)
+        self._dl_title = Gtk.Label(xalign=0)
+        self._dl_title.add_css_class("heading")
+        self._dl_title.set_ellipsize(Pango.EllipsizeMode.END)
+        self._dl_title.set_max_width_chars(22)
+        self._dl_sub = Gtk.Label(xalign=0)
+        self._dl_sub.add_css_class("dim-label")
+
+        text = Gtk.Box(orientation=Gtk.Orientation.VERTICAL)
+        text.set_hexpand(True)
+        text.append(self._dl_title)
+        text.append(self._dl_sub)
+
+        self._dl_pause_btn = Gtk.Button()
+        self._dl_pause_btn.add_css_class("flat")
+        self._dl_pause_btn.set_valign(Gtk.Align.CENTER)
+        self._dl_pause_btn.connect("clicked", self._on_dl_pause)
+
+        stop_btn = Gtk.Button(icon_name="media-playback-stop-symbolic")
+        stop_btn.add_css_class("flat")
+        stop_btn.set_valign(Gtk.Align.CENTER)
+        stop_btn.connect("clicked", self._on_dl_stop)
+
+        box = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=10)
+        box.append(self._dl_ring)
+        box.append(text)
+        box.append(self._dl_pause_btn)
+        box.append(stop_btn)
+
+        toast = Adw.Toast(timeout=0)
+        toast.set_custom_title(box)
+        toast.connect("dismissed", self._on_dl_toast_dismissed)
+        self._dl_toast = toast
+
+    def _on_dl_pause(self, _btn):
+        if self.manager.is_paused():
+            self.manager.resume()
+        else:
+            self.manager.pause()
+
+    def _on_dl_stop(self, _btn):
+        self.manager.stop()
+
+    def _on_dl_toast_dismissed(self, toast):
+        if self._dl_toast is toast:
+            self._dl_toast = None
+            self._dl_user_dismissed = True
+            self._refresh_downloads()
+
+    def _refresh_downloads(self):
+        page = self.navview.get_visible_page()
+        if isinstance(page, EpisodePage):
+            page.refresh_download_states()
+
+        pending = self.manager.pending_count()
+
+        if pending == 0:
+            t = self._dl_toast
+            self._dl_toast = None
+            self._dl_user_dismissed = False
+            self._set_queue_btns_visible(False)
+            if t is not None:
+                t.dismiss()
+            return
+
+        if self._dl_user_dismissed:
+            self._set_queue_btns_visible(True, self.manager.is_paused())
+            return
+        self._set_queue_btns_visible(False)
+
+        if self._dl_toast is None:
+            self._build_dl_toast()
+            self.toasts.add_toast(self._dl_toast)
+
+        paused = self.manager.is_paused()
+        self._dl_pause_btn.set_icon_name(
+            "media-playback-start-symbolic" if paused
+            else "media-playback-pause-symbolic"
+        )
+
+        job = self.manager.current_job()
+        if paused:
+            self._dl_ring.set_fraction(0.0)
+            self._dl_title.set_label("Paused")
+            self._dl_sub.set_label(f"{pending} in queue")
+        elif job is not None:
+            self._dl_ring.set_fraction(job.percent / 100.0)
+            self._dl_title.set_label(f"{job.anime.title} · Ep {job.episode.number}")
+            extra = pending - 1
+            if extra > 0:
+                self._dl_sub.set_label(
+                    f"{job.speed} · {extra} more queued" if job.speed
+                    else f"{extra} more queued")
+            else:
+                self._dl_sub.set_label(job.speed or "Downloading…")
+
 
 class AniDmApp(Adw.Application):
     def __init__(self):
@@ -251,12 +423,22 @@ class EpisodePage(Adw.NavigationPage):
         self.info = info
         self.anime = None
 
+        actions = Gio.SimpleActionGroup()
+        redl = Gio.SimpleAction.new("redownload", GLib.VariantType.new("s"))
+        redl.connect("activate", self._act_redownload)
+        actions.add_action(redl)
+        dele = Gio.SimpleAction.new("delete", GLib.VariantType.new("s"))
+        dele.connect("activate", self._act_delete)
+        actions.add_action(dele)
+        self.insert_action_group("ep", actions)
+
         self.download_btn = Gtk.Button(label="Download")
         self.download_btn.add_css_class("suggested-action")
         self.download_btn.set_sensitive(False)
         self.download_btn.connect("clicked", self._on_download)
 
         header = Adw.HeaderBar()
+        header.pack_start(self.window._make_queue_btn())
         header.pack_end(self.download_btn)
 
         self.pick_btn = Gtk.Button(label="Wrong match?")
@@ -457,20 +639,50 @@ class EpisodePage(Adw.NavigationPage):
         self._clear_list()
         self.anime = anime
         self.match_label.set_text(f"animepahe match: {anime.title}")
+
         for ep in episodes:
             row = Adw.ActionRow()
             row.set_title(f"Episode {ep.number}")
             if ep.duration or ep.audio:
                 row.set_subtitle(f"{ep.duration} · {ep.audio}")
+
             check = Gtk.CheckButton()
             check.set_valign(Gtk.Align.CENTER)
-            row.add_prefix(check)
+            check.set_halign(Gtk.Align.CENTER)
+            done_icon = Gtk.Image(icon_name="object-select-symbolic")
+            done_icon.add_css_class("success")
+            spinner = Gtk.Spinner()
+            queued = Gtk.Label(label="Queued")
+            queued.add_css_class("dim-label")
+
+            status = Gtk.Stack()
+            status.set_valign(Gtk.Align.CENTER)
+            status.set_halign(Gtk.Align.CENTER)
+            status.set_size_request(24, 24)
+            status.add_named(check, "select")
+            status.add_named(done_icon, "done")
+            status.add_named(spinner, "busy")
+            status.add_named(queued, "queued")
+            row.add_prefix(status)
             row.set_activatable_widget(check)
+
+            menu_btn = Gtk.MenuButton()
+            menu_btn.set_icon_name("view-more-symbolic")
+            menu_btn.add_css_class("flat")
+            menu_btn.set_valign(Gtk.Align.CENTER)
+            menu_btn.set_popover(self._make_episode_menu(ep))
+            menu_btn.set_visible(False)
+            row.add_suffix(menu_btn)
+
             row._episode = ep
             row._check = check
+            row._status = status
+            row._status_spinner = spinner
+            row._menu_btn = menu_btn
             self.listbox.append(row)
         self.list_spinner.stop()
         self.download_btn.set_sensitive(True)
+        self.refresh_download_states()
 
     def _on_error(self, message):
         self.list_spinner.stop()
@@ -487,26 +699,32 @@ class EpisodePage(Adw.NavigationPage):
         if not selected:
             self.window.toasts.add_toast(Adw.Toast(title="Select at least one episode."))
             return
-        self.download_btn.set_sensitive(False)
-        threading.Thread(target=self._download, args=(selected,), daemon=True).start()
+        for ep in selected:
+            self.window.manager.enqueue(self.anime, ep)
 
-    def _download(self, episodes):
-        done = 0
-        for ep in episodes:
-            try:
-                self.window.backend.download(self.anime, ep, str(LIBRARY_DIR))
-                done += 1
-                GLib.idle_add(self._toast, f"Downloaded episode {ep.number}")
-            except Exception as e:
-                GLib.idle_add(self._toast, f"Episode {ep.number} failed: {e}")
-        GLib.idle_add(self._download_finished, done, len(episodes))
+    def _make_episode_menu(self, ep):
+        menu = Gio.Menu()
+        menu.append("Redownload", f"ep.redownload::{ep.number}")
+        menu.append("Delete", f"ep.delete::{ep.number}")
+        return Gtk.PopoverMenu.new_from_model(menu)
 
-    def _toast(self, msg):
-        self.window.toasts.add_toast(Adw.Toast(title=msg))
+    def _act_redownload(self, _action, param):
+        number = int(param.get_string())
+        ep = self._episode_by_number(number)
+        if ep is not None:
+            self.window.manager.enqueue(self.anime, ep)
 
-    def _download_finished(self, done, total):
-        self.download_btn.set_sensitive(True)
-        self._toast(f"Finished: {done}/{total} downloaded")
+    def _act_delete(self, _action, param):
+        number = int(param.get_string())
+        ep = self._episode_by_number(number)
+        if ep is not None:
+            self._confirm_delete(ep)
+
+    def _episode_by_number(self, number):
+        for row in self._rows():
+            if row._episode.number == number:
+                return row._episode
+        return None
 
     def _on_pick(self, _btn):
         self.window.navview.push(PickerPage(self.window, self.info, self))
@@ -569,6 +787,77 @@ class EpisodePage(Adw.NavigationPage):
         active = button.get_active()
         self.more_btn.set_label("Show Less" if active else "Show More")
         self.synopsis.set_revealed(active)
+
+    def _downloaded_numbers(self):
+        numbers = set()
+        for row in self._rows():
+            ep = row._episode
+            if self.window.backend.library_path(self.anime, ep, LIBRARY_DIR).exists():
+                numbers.add(ep.number)
+        return numbers
+
+    def refresh_download_states(self):
+        if getattr(self, "anime", None) is None:
+            return
+        downloaded = self._downloaded_numbers()
+        for row in self._rows():
+            ep = row._episode
+            st = self.window.manager.status_for(self.anime, ep)
+            if st == Status.DOWNLOADING:
+                row._status.set_visible_child_name("busy")
+                row._status_spinner.start()
+            elif st == Status.QUEUED:
+                row._status.set_visible_child_name("queued")
+                row._status_spinner.stop()
+            elif ep.number in downloaded:
+                row._status.set_visible_child_name("done")
+                row._status_spinner.stop()
+            else:
+                row._status.set_visible_child_name("select")
+                row._status_spinner.stop()
+            row._menu_btn.set_visible(
+                st in (Status.DOWNLOADING, Status.QUEUED)
+                or ep.number in downloaded
+            )
+
+    def _confirm_delete(self, ep):
+        if self.window.skip_delete_confirm:
+            self._do_delete(ep)
+            return
+
+        dialog = Adw.MessageDialog(
+            transient_for=self.window,
+            heading="Delete this episode?",
+            body=f"Episode {ep.number} will be moved to Trash.",
+        )
+        check = Gtk.CheckButton(label="Don't ask again this session")
+        dialog.set_extra_child(check)
+        dialog.add_response("cancel", "Cancel")
+        dialog.add_response("delete", "Delete")
+        dialog.set_response_appearance("delete", Adw.ResponseAppearance.DESTRUCTIVE)
+        dialog.set_default_response("cancel")
+        dialog.set_close_response("cancel")
+        dialog.connect("response", self._on_delete_response, ep, check)
+        dialog.present()
+
+    def _on_delete_response(self, _dialog, response, ep, check):
+        if response != "delete":
+            return
+        if check.get_active():
+            self.window.skip_delete_confirm = True
+        self._do_delete(ep)
+
+    def _do_delete(self, ep):
+        path = self.window.backend.library_path(self.anime, ep, LIBRARY_DIR)
+        try:
+            Gio.File.new_for_path(str(path)).trash(None)
+        except GLib.Error:
+            pass
+        for row in self._rows():
+            if row._episode.number == ep.number:
+                row._check.set_active(False)
+                break
+        self.refresh_download_states()
 
 
 class PickerPage(Adw.NavigationPage):

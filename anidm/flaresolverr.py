@@ -18,16 +18,16 @@ def _exists():
     result = _run(["ps", "-a", "--filter", f"name={CONTAINER_NAME}", "--format", "{{.Names}}"])
     return CONTAINER_NAME in result.stdout.split()
 
-def wait_until_ready(timeout=45):
+def wait_until_ready(timeout=60):
     import time
     import urllib.request
     deadline = time.time() + timeout
     while time.time() < deadline:
         try:
-            urllib.request.urlopen("http://localhost:8191/", timeout=3)
+            urllib.request.urlopen("http://localhost:8191/", timeout=2)
             return True
         except Exception:
-            time.sleep(2)
+            time.sleep(0.3)
     return False
 
 def start():

@@ -8,6 +8,7 @@ from curl_cffi import requests
 
 from .base import Anime, Episode, Backend
 from ..clearance import fetch_clearance, refresh_config
+from .. import flaresolverr
 
 HOST = "https://animepahe.pw"
 SCRIPT_DIR = Path(__file__).resolve().parent.parent.parent / "vendor" / "animepahe-dl"
@@ -34,16 +35,17 @@ class AnimepaheBackend(Backend):
             return self._creds
 
     def warm_clearance(self):
-        import time
-        for attempt in range(10):
+        if not flaresolverr.wait_until_ready():
+            print("WARM: flaresolverr never became reachable")
+            return
+        for attempt in (1, 2):
             try:
-                self._ensure_clearance(self)
+                self._ensure_clearance(force=True)
                 print("WARM: cookie minted successfully")
                 return
             except Exception as e:
-                print(f"WARM: attempt {attempt + 1} failed - {e}")
-                time.sleep(3)
-        print("WARM: gave up after retries")
+                print(f"WARM: attempt {attempt} failed - {e}")
+        print("WARM: gave up")
 
     def _api_get(self, url):
         for attempt in (1, 2):
@@ -105,13 +107,45 @@ class AnimepaheBackend(Backend):
 
         return episodes
 
-    def download(self, anime, episode, dest_dir):
+    def download(self, anime, episode, dest_dir, on_progress=None, on_proc=None):
         refresh_config(CONFIG_PATH)
-        subprocess.run(
+        proc = subprocess.Popen(
             [str(SCRIPT), "-s", anime.slug, "-e", str(episode.number)],
             cwd=str(SCRIPT_DIR),
-            check=True,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.STDOUT,
+            text=True,
+            bufsize=1,
+            start_new_session=True,
         )
+        if on_proc:
+            on_proc(proc)
+
+
+        tail = []
+        for line in proc.stdout:
+            line = line.strip()
+            if line.startswith("ANIDM"):
+                parts = line[len("ANIDM"):].strip().split("|")
+                if len(parts) == 3:
+                    pct = parts[0].strip().rstrip("%")
+                    try:
+                        percent = float(pct)
+                    except ValueError:
+                        continue
+                    if on_progress:
+                        on_progress(percent, parts[1].strip(), parts[2].strip())
+            elif line:
+                tail.append(line)
+                tail = tail[-8:]
+
+        proc.wait()
+        if proc.returncode != 0:
+            detail = "\n".join(tail[-5:])
+            raise RuntimeError(
+                f"Download failed (exit {proc.returncode}) for episode "
+                f"{episode.number}:\n{detail}"
+            )
 
         matches = list(SCRIPT_DIR.glob(f"*/{episode.number}.mp4"))
         if not matches:
@@ -120,12 +154,16 @@ class AnimepaheBackend(Backend):
             )
         produced = max(matches, key=lambda p: p.stat().st_mtime)
 
-        safe_title = anime.title.replace(":", "").replace("/", "-")
-        series_dir = Path(dest_dir) / safe_title
-        series_dir.mkdir(parents=True, exist_ok=True)
-        final = series_dir / f"{safe_title} - Ep {episode.number}.mp4"
+        final = self.library_path(anime, episode, dest_dir)
+        final.parent.mkdir(parents=True, exist_ok=True)
 
         source_folder = produced.parent
         shutil.move(str(produced), str(final))
         shutil.rmtree(source_folder, ignore_errors=True)
-        return str(final)
+        return str(final) 
+    
+    @staticmethod
+    def library_path(anime, episode, dest_dir):
+        safe_title = anime.title.replace(":", "").replace("/", "-")
+        return Path(dest_dir) / safe_title / f"{safe_title} - Ep {episode.number}.mp4"
+
