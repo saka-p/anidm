@@ -63,6 +63,20 @@ class AnimepaheBackend(Backend):
 
         raise RuntimeError("animepahe request failed after refreshing clearance.")
 
+    def fetch_index(self):
+        for attempt in (1, 2):
+            cf, ua = self._ensure_clearance(force=(attempt == 2))
+            resp = requests.get(
+                f"{HOST}/anime",
+                cookies={"cf_clearance": cf},
+                headers={"User-Agent": ua},
+                impersonate="chrome",
+                timeout=30,
+            )
+            if resp.status_code == 200:
+                return resp.text
+        raise RuntimeError("Failed to fetch animepahe index after refreshing clearance.")
+
     def _clean_query(self, q):
         return q.replace("-", " ").replace(":", " ")
 
@@ -166,4 +180,3 @@ class AnimepaheBackend(Backend):
     def library_path(anime, episode, dest_dir):
         safe_title = anime.title.replace(":", "").replace("/", "-")
         return Path(dest_dir) / safe_title / f"{safe_title} - Ep {episode.number}.mp4"
-

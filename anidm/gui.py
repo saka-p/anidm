@@ -4,6 +4,8 @@ import re
 import html
 import math
 import cairo
+import json
+import dataclasses
 
 gi.require_version("Gtk", "4.0")
 gi.require_version("Adw", "1")
@@ -15,8 +17,10 @@ from gi.repository import Adw, Gtk, Gdk, Gio, GLib, Pango, GdkPixbuf, GObject
 from curl_cffi import requests
 
 from . import flaresolverr
-from .metadata.anilist import AniListClient
+from .metadata.anilist import AniListClient, AnimeInfo
 from .backends.animepahe import AnimepaheBackend, LIBRARY_DIR
+from .backends.base import Anime
+from . import catalog
 from .synopsis_fading import SynopsisFading
 from .downloads import DownloadManager, Status
 
@@ -31,6 +35,29 @@ def _norm(s):
 
 def _similar(a, b):
     return SequenceMatcher(None, _norm(a), _norm(b)).ratio()
+
+
+SIDECAR_NAME = ".anidm.json"
+
+
+def write_sidecar(folder, info):
+    try:
+        data = dataclasses.asdict(info)
+        (Path(folder) / SIDECAR_NAME).write_text(json.dumps(data, indent=2))
+    except Exception:
+        pass
+
+
+def read_sidecar(folder):
+    try:
+        data = json.loads((Path(folder) / SIDECAR_NAME).read_text())
+        return AnimeInfo(**data)
+    except Exception:
+        return None
+
+
+def play_file(path):
+    Gio.AppInfo.launch_default_for_uri(Path(path).as_uri(), None)
 
 
 class ProgressRing(Gtk.DrawingArea):
@@ -59,6 +86,122 @@ class ProgressRing(Gtk.DrawingArea):
             cr.arc(cx, cy, radius, start, start + 2 * math.pi * self._fraction)
             cr.stroke()
 
+class LibraryView(Gtk.Box):                                      # ← new class goes here
+    def __init__(self, window):
+        super().__init__(orientation=Gtk.Orientation.VERTICAL)
+        self.window = window
+
+        self.flowbox = Gtk.FlowBox()
+        self.flowbox.set_selection_mode(Gtk.SelectionMode.NONE)
+        self.flowbox.set_valign(Gtk.Align.START)
+        self.flowbox.set_homogeneous(True)
+        self.flowbox.set_column_spacing(12)
+        self.flowbox.set_row_spacing(12)
+        self.flowbox.set_min_children_per_line(2)
+        self.flowbox.set_max_children_per_line(999)
+        self.flowbox.set_margin_top(12)
+        self.flowbox.set_margin_bottom(12)
+        self.flowbox.set_margin_start(12)
+        self.flowbox.set_margin_end(12)
+        self.flowbox.connect("child-activated", self._on_tile_activated)
+
+        grid_scroller = Gtk.ScrolledWindow()
+        grid_scroller.set_vexpand(True)
+        grid_scroller.set_child(self.flowbox)
+
+        self.empty = Adw.StatusPage()
+        self.empty.set_icon_name("folder-videos-symbolic")
+        self.empty.set_title("No downloads yet")
+        self.empty.set_description("Anime you download will show up here.")
+
+        self.stack = Gtk.Stack()
+        self.stack.add_named(grid_scroller, "grid")
+        self.stack.add_named(self.empty, "empty")
+        self.append(self.stack)
+
+    def refresh(self):
+        child = self.flowbox.get_first_child()
+        while child is not None:
+            self.flowbox.remove(child)
+            child = self.flowbox.get_first_child()
+
+        series = self._scan()
+        if not series:
+            self.stack.set_visible_child_name("empty")
+            return
+        self.stack.set_visible_child_name("grid")
+        for name, path, count, info in series:
+            self.flowbox.insert(self._make_tile(name, path, count, info), -1)
+
+    def _scan(self):
+        results = []
+        if not LIBRARY_DIR.is_dir():
+            return results
+        for folder in sorted(LIBRARY_DIR.iterdir()):
+            if not folder.is_dir():
+                continue
+            episodes = list(folder.glob("*.mp4"))
+            if episodes:
+                info = read_sidecar(folder)
+                results.append((folder.name, folder, len(episodes), info))
+        return results
+
+    def _make_tile(self, name, path, count, info):
+        cover_wrap = Gtk.Box()
+        cover_wrap.add_css_class("cover")
+        cover_wrap.set_overflow(Gtk.Overflow.HIDDEN)
+        cover_wrap.set_size_request(COVER_W, COVER_H)
+        cover_wrap.set_halign(Gtk.Align.CENTER)
+
+        if info is not None:
+            picture = Gtk.Picture()
+            picture.set_size_request(COVER_W, COVER_H)
+            cover_wrap.append(picture)
+            self.window.cover_pool.submit(self.window._load_cover, info, picture)
+        else:
+            icon = Gtk.Image(icon_name="video-x-generic-symbolic")
+            icon.set_pixel_size(96)
+            icon.add_css_class("dim-label")
+            icon.set_halign(Gtk.Align.CENTER)
+            icon.set_valign(Gtk.Align.CENTER)
+            icon.set_hexpand(True)
+            icon.set_vexpand(True)
+            cover_wrap.append(icon)
+
+        title = Gtk.Label(label=(info.title if info else name))
+        title.set_wrap(True)
+        title.set_lines(2)
+        title.set_ellipsize(Pango.EllipsizeMode.END)
+        title.set_justify(Gtk.Justification.CENTER)
+        title.set_max_width_chars(18)
+        title.set_width_chars(18)
+        title.set_valign(Gtk.Align.START)
+
+        sub = Gtk.Label(label=f"{count} episode{'s' if count != 1 else ''}")
+        sub.add_css_class("dim-label")
+        sub.add_css_class("caption")
+
+        card = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=6)
+        card.append(cover_wrap)
+        card.append(title)
+        card.append(sub)
+        card.info = info
+        card.series_name = name
+        card.series_path = str(path)
+        return card
+
+    def _on_tile_activated(self, _flowbox, child):
+        card = child.get_child()
+        info = getattr(card, "info", None)
+        if info is None:
+            info = AnimeInfo(
+                anilist_id=None, title=card.series_name, romaji=card.series_name,
+                english=card.series_name, year=None, season=None, episodes=None,
+                score=None, genres=[], cover_url=None, cover_url_large=None,
+                format=None, description=None,
+            )
+        self.window.navview.push(EpisodePage(self.window, info))
+
 
 class AniDmWindow(Adw.ApplicationWindow):
     def __init__(self, app):
@@ -72,6 +215,7 @@ class AniDmWindow(Adw.ApplicationWindow):
         self.anilist = AniListClient()
         self.backend = AnimepaheBackend()
         threading.Thread(target=self.backend.warm_clearance, daemon=True).start()
+        threading.Thread(target=self._refresh_catalog_if_stale, daemon=True).start()
         self.cover_pool = ThreadPoolExecutor(max_workers=4)
         self._dl_toast = None
         self._dl_user_dismissed = False
@@ -111,17 +255,31 @@ class AniDmWindow(Adw.ApplicationWindow):
         box.append(self.spinner)
         box.append(scroller)
 
-        search_header = Adw.HeaderBar()
-        search_header.pack_start(self._make_queue_btn())
+        self.view_stack = Adw.ViewStack()
+        self.view_stack.add_titled_with_icon(box, "search", "Search", "system-search-symbolic")
 
-        search_toolbar = Adw.ToolbarView()
-        search_toolbar.add_top_bar(search_header)
-        search_toolbar.set_content(box)
+        self.library = LibraryView(self)
+        self.view_stack.add_titled_with_icon(
+            self.library, "library", "Library", "folder-videos-symbolic"
+        )
+        self.view_stack.connect("notify::visible-child-name", self._on_view_changed)
 
-        search_page = Adw.NavigationPage(child=search_toolbar, title="Search")
+        switcher = Adw.ViewSwitcher()
+        switcher.set_stack(self.view_stack)
+        switcher.set_policy(Adw.ViewSwitcherPolicy.WIDE)
+
+        root_header = Adw.HeaderBar()
+        root_header.set_title_widget(switcher)
+        root_header.pack_start(self._make_queue_btn())
+
+        root_toolbar = Adw.ToolbarView()
+        root_toolbar.add_top_bar(root_header)
+        root_toolbar.set_content(self.view_stack)
+
+        root_page = Adw.NavigationPage(child=root_toolbar, title="Ani-dm")
 
         self.navview = Adw.NavigationView()
-        self.navview.add(search_page)
+        self.navview.add(root_page)
 
         self.toasts = Adw.ToastOverlay()
         self.toasts.set_child(self.navview)
@@ -169,9 +327,19 @@ class AniDmWindow(Adw.ApplicationWindow):
         self._cover_size = (int(width), int(height))
 
     def _on_child_activated(self, _flowbox, child):
-        info = child.get_child().info
-        self.navview.push(EpisodePage(self, info))
+        anime = child.get_child().anime
+        info = AnimeInfo(
+            anilist_id=None, title=anime.title, romaji=anime.title,
+            english=anime.title, year=anime.year, season=None,
+            episodes=anime.episodes, score=None, genres=[],
+            cover_url=None, cover_url_large=None, format=None, description=None,
+        )
+        self.navview.push(EpisodePage(self, info, anime=anime))
         self._refresh_downloads()
+
+    def _on_view_changed(self, *args):
+        if self.view_stack.get_visible_child_name() == "library":
+            self.library.refresh()
 
     def _on_search(self, entry):
         query = entry.get_text().strip()
@@ -181,39 +349,44 @@ class AniDmWindow(Adw.ApplicationWindow):
         threading.Thread(target=self._do_search, args=(query,), daemon=True).start()
 
     def _do_search(self, query):
-        try:
-            results = self.anilist.search(query)
-        except Exception as e:
-            GLib.idle_add(self._on_search_error, str(e))
-            return
-        GLib.idle_add(self._on_search_done, results)
+        results = catalog.search(query)
+        animes = [Anime(slug=r["session"], title=r["title"], episodes=None, year=None)
+                  for r in results]
+        if not animes:
+            try:
+                animes = self.backend.search(query)
+            except Exception as e:
+                GLib.idle_add(self._on_search_error, str(e))
+                return
+        GLib.idle_add(self._on_search_done, animes)
 
     def _on_search_done(self, results):
         self._clear_results()
         self._compute_cover_size()
-        for info in results:
-            card, picture = self._make_card(info)
-            self.results.insert(card, -1)
-            self.cover_pool.submit(self._load_cover, info, picture)
+        for anime in results:
+            self.results.insert(self._make_card(anime), -1)
         self._set_loading(False)
 
     def _on_search_error(self, message):
         self._set_loading(False)
         self.toasts.add_toast(Adw.Toast(title=f"Search failed: {message}"))
 
-    def _make_card(self, info):
+    def _make_card(self, anime):
         w, h = self._cover_size
-        picture = Gtk.Picture()
-        picture.set_size_request(w, h)
+        icon = Gtk.Image(icon_name="video-x-generic-symbolic")
+        icon.set_pixel_size(96)
+        icon.add_css_class("dim-label")
+        icon.set_halign(Gtk.Align.CENTER)
+        icon.set_valign(Gtk.Align.CENTER)
 
         cover_wrap = Gtk.Box()
         cover_wrap.add_css_class("cover")
         cover_wrap.set_overflow(Gtk.Overflow.HIDDEN)
         cover_wrap.set_size_request(w, h)
         cover_wrap.set_halign(Gtk.Align.CENTER)
-        cover_wrap.append(picture)
+        cover_wrap.append(icon)
 
-        title = Gtk.Label(label=info.title)
+        title = Gtk.Label(label=anime.title)
         title.set_wrap(True)
         title.set_lines(2)
         title.set_ellipsize(Pango.EllipsizeMode.END)
@@ -227,8 +400,8 @@ class AniDmWindow(Adw.ApplicationWindow):
         card.set_hexpand(True)
         card.append(cover_wrap)
         card.append(title)
-        card.info = info
-        return card, picture
+        card.anime = anime
+        return card
 
     @staticmethod
     def _scale_crop(pixbuf, tw, th):
@@ -347,6 +520,11 @@ class AniDmWindow(Adw.ApplicationWindow):
         if isinstance(page, EpisodePage):
             page.refresh_download_states()
 
+        for job in self.manager.drain_errors():
+            lines = [l for l in (job.error or "").strip().splitlines() if l.strip()]
+            reason = lines[-1] if lines else "unknown error"
+            self.toasts.add_toast(Adw.Toast(title=f"Episode {job.episode.number} failed: {reason}"))
+
         pending = self.manager.pending_count()
 
         if pending == 0:
@@ -389,6 +567,14 @@ class AniDmWindow(Adw.ApplicationWindow):
             else:
                 self._dl_sub.set_label(job.speed or "Downloading…")
 
+    def _refresh_catalog_if_stale(self):
+        if not catalog.is_stale():
+            return
+        try:
+            catalog.save(catalog.parse_index(self.backend.fetch_index()))
+        except Exception:
+            pass
+
 
 class AniDmApp(Adw.Application):
     def __init__(self):
@@ -417,11 +603,11 @@ class AniDmApp(Adw.Application):
 
 
 class EpisodePage(Adw.NavigationPage):
-    def __init__(self, window, info):
+    def __init__(self, window, info, anime=None):
         super().__init__(title=info.title)
         self.window = window
         self.info = info
-        self.anime = None
+        self.anime = anime
 
         actions = Gio.SimpleActionGroup()
         redl = Gio.SimpleAction.new("redownload", GLib.VariantType.new("s"))
@@ -569,7 +755,10 @@ class EpisodePage(Adw.NavigationPage):
 
         self.stack.set_visible_child_name("list")
         self.list_spinner.start()
-        threading.Thread(target=self._load, daemon=True).start()
+        if anime is not None:
+            threading.Thread(target=self._load_chosen, args=(anime,), daemon=True).start()
+        else:
+            threading.Thread(target=self._load, daemon=True).start()
         threading.Thread(target=self._load_detail_cover, daemon=True).start()
 
     def _make_pick_button(self, label):
@@ -666,11 +855,18 @@ class EpisodePage(Adw.NavigationPage):
             row.add_prefix(status)
             row.set_activatable_widget(check)
 
+            play_btn = Gtk.Button(icon_name="media-playback-start-symbolic")
+            play_btn.add_css_class("flat")
+            play_btn.set_valign(Gtk.Align.CENTER)
+            play_btn.set_visible(False)
+            play_btn.connect("clicked", self._on_row_play, ep)
+            row.add_suffix(play_btn)
+
             menu_btn = Gtk.MenuButton()
             menu_btn.set_icon_name("view-more-symbolic")
             menu_btn.add_css_class("flat")
             menu_btn.set_valign(Gtk.Align.CENTER)
-            menu_btn.set_popover(self._make_episode_menu(ep))
+            menu_btn.set_popover(self._make_episode_menu(ep, False))
             menu_btn.set_visible(False)
             row.add_suffix(menu_btn)
 
@@ -679,6 +875,8 @@ class EpisodePage(Adw.NavigationPage):
             row._status = status
             row._status_spinner = spinner
             row._menu_btn = menu_btn
+            row._play_btn = play_btn
+            row._menu_dl = False
             self.listbox.append(row)
         self.list_spinner.stop()
         self.download_btn.set_sensitive(True)
@@ -699,14 +897,27 @@ class EpisodePage(Adw.NavigationPage):
         if not selected:
             self.window.toasts.add_toast(Adw.Toast(title="Select at least one episode."))
             return
+        folder = self.window.backend.library_path(self.anime, selected[0], LIBRARY_DIR).parent
+        folder.mkdir(parents=True, exist_ok=True)
+        write_sidecar(folder, self.info)
         for ep in selected:
             self.window.manager.enqueue(self.anime, ep)
 
-    def _make_episode_menu(self, ep):
+    def _make_episode_menu(self, ep, downloaded):
         menu = Gio.Menu()
         menu.append("Redownload", f"ep.redownload::{ep.number}")
-        menu.append("Delete", f"ep.delete::{ep.number}")
+        if downloaded:
+            menu.append("Delete", f"ep.delete::{ep.number}")
         return Gtk.PopoverMenu.new_from_model(menu)
+
+    def _act_play(self, _action, param):
+        number = int(param.get_string())
+        ep = self._episode_by_number(number)
+        if ep is not None:
+            play_file(self.window.backend.library_path(self.anime, ep, LIBRARY_DIR))
+    
+    def _on_row_play(self, _btn, ep):
+        play_file(self.window.backend.library_path(self.anime, ep, LIBRARY_DIR))
 
     def _act_redownload(self, _action, param):
         number = int(param.get_string())
@@ -819,6 +1030,11 @@ class EpisodePage(Adw.NavigationPage):
                 st in (Status.DOWNLOADING, Status.QUEUED)
                 or ep.number in downloaded
             )
+            row._play_btn.set_visible(ep.number in downloaded)
+            is_dl = ep.number in downloaded
+            if getattr(row, "_menu_dl", None) != is_dl:
+                row._menu_btn.set_popover(self._make_episode_menu(ep, is_dl))
+                row._menu_dl = is_dl
 
     def _confirm_delete(self, ep):
         if self.window.skip_delete_confirm:

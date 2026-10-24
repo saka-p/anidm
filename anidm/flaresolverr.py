@@ -18,6 +18,11 @@ def _exists():
     result = _run(["ps", "-a", "--filter", f"name={CONTAINER_NAME}", "--format", "{{.Names}}"])
     return CONTAINER_NAME in result.stdout.split()
 
+
+def _is_host_net():
+    result = _run(["inspect", "--format", "{{.HostConfig.NetworkMode}}", CONTAINER_NAME])
+    return result.stdout.strip() == "host"
+
 def wait_until_ready(timeout=60):
     import time
     import urllib.request
@@ -31,13 +36,15 @@ def wait_until_ready(timeout=60):
     return False
 
 def start():
+    if _exists() and not _is_host_net():
+        _run(["rm", "-f", CONTAINER_NAME])
     if _running():
         return
     if _exists():
         _run(["start", CONTAINER_NAME])
     else:
         _run(["run", "-d", "--name", CONTAINER_NAME,
-              "-p", f"{PORT}:{PORT}", IMAGE])
+              "--network=host", "--restart", "unless-stopped", IMAGE])
 
 
 def stop():

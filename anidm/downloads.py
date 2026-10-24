@@ -21,6 +21,7 @@ class DownloadJob:
     speed: str = ""
     eta: str = ""
     error: str = ""
+    reported: bool = False
 
 
 class DownloadManager:
@@ -158,6 +159,15 @@ class DownloadManager:
         with self._lock:
             return sum(1 for j in self._jobs
                        if j.status in (Status.QUEUED, Status.DOWNLOADING))
+
+    def drain_errors(self):
+        out = []
+        with self._lock:
+            for j in self._jobs:
+                if j.status == Status.ERROR and not j.reported:
+                    j.reported = True
+                    out.append(j)
+        return out
 
     def status_for(self, anime, episode):
         with self._lock:
