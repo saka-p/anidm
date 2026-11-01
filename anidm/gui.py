@@ -5,6 +5,7 @@ import html
 import math
 import cairo
 import json
+import hashlib
 import dataclasses
 
 gi.require_version("Gtk", "4.0")
@@ -21,6 +22,7 @@ from .metadata.anilist import AniListClient, AnimeInfo
 from .backends.animepahe import AnimepaheBackend, LIBRARY_DIR
 from .backends.base import Anime
 from . import catalog
+from . import meta
 from .synopsis_fading import SynopsisFading
 from .downloads import DownloadManager, Status
 
@@ -328,11 +330,15 @@ class AniDmWindow(Adw.ApplicationWindow):
 
     def _on_child_activated(self, _flowbox, child):
         anime = child.get_child().anime
+        m = meta.get_by_title(anime.title)
         info = AnimeInfo(
-            anilist_id=None, title=anime.title, romaji=anime.title,
-            english=anime.title, year=anime.year, season=None,
-            episodes=anime.episodes, score=None, genres=[],
-            cover_url=None, cover_url_large=None, format=None, description=None,
+            anilist_id=m.get("anilist_id"),
+            title=anime.title, romaji=anime.title, english=anime.title,
+            year=m.get("year") or anime.year, season=None,
+            episodes=m.get("episodes") or anime.episodes, score=m.get("score"),
+            genres=m.get("genres") or [],
+            cover_url=m.get("cover_url"), cover_url_large=m.get("cover_url"),
+            format=m.get("type"), description=m.get("synopsis"),
         )
         self.navview.push(EpisodePage(self, info, anime=anime))
         self._refresh_downloads()
@@ -373,18 +379,26 @@ class AniDmWindow(Adw.ApplicationWindow):
 
     def _make_card(self, anime):
         w, h = self._cover_size
-        icon = Gtk.Image(icon_name="video-x-generic-symbolic")
-        icon.set_pixel_size(96)
-        icon.add_css_class("dim-label")
-        icon.set_halign(Gtk.Align.CENTER)
-        icon.set_valign(Gtk.Align.CENTER)
+        cover_url = meta.get_by_title(anime.title).get("cover_url")
 
         cover_wrap = Gtk.Box()
         cover_wrap.add_css_class("cover")
         cover_wrap.set_overflow(Gtk.Overflow.HIDDEN)
         cover_wrap.set_size_request(w, h)
         cover_wrap.set_halign(Gtk.Align.CENTER)
-        cover_wrap.append(icon)
+
+        if cover_url:
+            picture = Gtk.Picture()
+            picture.set_size_request(w, h)
+            cover_wrap.append(picture)
+            self.cover_pool.submit(self._load_cover_url, cover_url, picture, w, h)
+        else:
+            icon = Gtk.Image(icon_name="video-x-generic-symbolic")
+            icon.set_pixel_size(96)
+            icon.add_css_class("dim-label")
+            icon.set_halign(Gtk.Align.CENTER)
+            icon.set_valign(Gtk.Align.CENTER)
+            cover_wrap.append(icon)
 
         title = Gtk.Label(label=anime.title)
         title.set_wrap(True)
@@ -432,6 +446,27 @@ class AniDmWindow(Adw.ApplicationWindow):
             loader.write(data)
             loader.close()
             pixbuf = self._scale_crop(loader.get_pixbuf(), COVER_W, COVER_H)
+            texture = Gdk.Texture.new_for_pixbuf(pixbuf)
+        except Exception:
+            return
+        GLib.idle_add(picture.set_paintable, texture)
+
+    def _load_cover_url(self, url, picture, w, h):
+        if not url:
+            return
+        cache_file = COVER_CACHE / (hashlib.md5(url.encode()).hexdigest() + ".img")
+        try:
+            if cache_file.exists():
+                data = cache_file.read_bytes()
+            else:
+                resp = requests.get(url, impersonate="chrome", timeout=15)
+                resp.raise_for_status()
+                data = resp.content
+                cache_file.write_bytes(data)
+            loader = GdkPixbuf.PixbufLoader()
+            loader.write(data)
+            loader.close()
+            pixbuf = self._scale_crop(loader.get_pixbuf(), w, h)
             texture = Gdk.Texture.new_for_pixbuf(pixbuf)
         except Exception:
             return
@@ -948,11 +983,23 @@ class EpisodePage(Adw.NavigationPage):
 
     def _load_chosen(self, anime):
         try:
+            anime = self._resolve_live(anime)
             episodes = self.window.backend.list_episodes(anime)
         except Exception as e:
             GLib.idle_add(self._on_error, str(e))
             return
         GLib.idle_add(self._on_loaded, anime, episodes)
+
+    def _resolve_live(self, anime):
+        target = _norm(anime.title)
+        try:
+            results = self.window.backend.search(anime.title)
+        except Exception:
+            return anime
+        for r in results:
+            if _norm(r.title) == target:
+                return r
+        return anime
 
     def _clear_list(self):
         row = self.listbox.get_first_child()
