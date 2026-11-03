@@ -218,7 +218,7 @@ class AniDmWindow(Adw.ApplicationWindow):
         self.backend = AnimepaheBackend()
         threading.Thread(target=self.backend.warm_clearance, daemon=True).start()
         threading.Thread(target=self._refresh_catalog_if_stale, daemon=True).start()
-        self.cover_pool = ThreadPoolExecutor(max_workers=4)
+        self.cover_pool = ThreadPoolExecutor(max_workers=12)
         self._dl_toast = None
         self._dl_user_dismissed = False
         self._queue_btns = []
