@@ -2,9 +2,9 @@
 Type=Application
 Name=Ani-dm
 Comment=Browse and download anime
-Exec=sh -c "cd $HOME/Projects/Ani-dm && exec python3 -m anidm.gui"
+Exec=sh -c "cd \\$HOME/Projects/Ani-dm && exec python3 -m anidm.gui"
 Icon=multimedia-video-player
 Terminal=false
-Categories=AudioVideo;Video;Network;
+Categories=AudioVideo;Video;
 Keywords=anime;download;video;
 StartupNotify=true
