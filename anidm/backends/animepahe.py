@@ -2,6 +2,7 @@ import subprocess
 import urllib.parse
 import shutil
 import threading
+import re
 
 from pathlib import Path
 from curl_cffi import requests
@@ -9,12 +10,32 @@ from curl_cffi import requests
 from .base import Anime, Episode, Backend
 from ..clearance import fetch_clearance, refresh_config
 from .. import flaresolverr
+from .. import meta
 
 HOST = "https://animepahe.pw"
 SCRIPT_DIR = Path(__file__).resolve().parent.parent.parent / "vendor" / "animepahe-dl"
 SCRIPT = SCRIPT_DIR / "animepahe-dl.sh"
 CONFIG_PATH = SCRIPT_DIR / "config.json"
 LIBRARY_DIR = Path.home() / "Videos" / "ani-dm"
+
+
+def _safe(name):
+    cleaned = name.replace("/", "-").replace("\\", "-")
+    cleaned = re.sub(r"[\x00-\x1f]", "", cleaned)
+    return cleaned.strip().rstrip(".") or "Untitled"
+
+
+def _ep_tag(number):
+    try:
+        return f"E{int(number):02d}"
+    except (TypeError, ValueError):
+        return f"E{number}"
+
+
+def _season_for(mtype):
+    if (mtype or "").lower() in ("ova", "special", "music"):
+        return 0
+    return 1
 
 
 class AnimepaheBackend(Backend):
@@ -177,6 +198,21 @@ class AnimepaheBackend(Backend):
         return str(final) 
     
     @staticmethod
+    def library_root(anime, dest_dir):
+        m = meta.get_by_title(anime.title)
+        safe = _safe(anime.title)
+        dest = Path(dest_dir)
+        if (m.get("type") or "").lower() == "movie":
+            name = f"{safe} ({m['year']})" if m.get("year") else safe
+            return dest / "Movies" / name
+        return dest / "Shows" / safe
+
+    @staticmethod
     def library_path(anime, episode, dest_dir):
-        safe_title = anime.title.replace(":", "").replace("/", "-")
-        return Path(dest_dir) / safe_title / f"{safe_title} - Ep {episode.number}.mp4"
+        m = meta.get_by_title(anime.title)
+        root = AnimepaheBackend.library_root(anime, dest_dir)
+        if (m.get("type") or "").lower() == "movie":
+            return root / f"{root.name}.mp4"
+        season = _season_for(m.get("type"))
+        return (root / f"Season {season:02d}"
+                / f"{_safe(anime.title)} S{season:02d}{_ep_tag(episode.number)}.mp4")

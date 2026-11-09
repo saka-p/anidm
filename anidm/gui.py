@@ -139,13 +139,27 @@ class LibraryView(Gtk.Box):                                      # ← new class
         results = []
         if not LIBRARY_DIR.is_dir():
             return results
-        for folder in sorted(LIBRARY_DIR.iterdir()):
-            if not folder.is_dir():
-                continue
-            episodes = list(folder.glob("*.mp4"))
-            if episodes:
-                info = read_sidecar(folder)
-                results.append((folder.name, folder, len(episodes), info))
+
+        movies = LIBRARY_DIR / "Movies"
+        if movies.is_dir():
+            for folder in sorted(movies.iterdir()):
+                if not folder.is_dir():
+                    continue
+                count = len(list(folder.glob("*.mp4")))
+                if count:
+                    info = read_sidecar(folder)
+                    results.append((folder.name, folder, count, info))
+
+        shows = LIBRARY_DIR / "Shows"
+        if shows.is_dir():
+            for folder in sorted(shows.iterdir()):
+                if not folder.is_dir():
+                    continue
+                count = len(list(folder.glob("Season */*.mp4")))
+                if count:
+                    info = read_sidecar(folder)
+                    results.append((folder.name, folder, count, info))
+
         return results
 
     def _make_tile(self, name, path, count, info):
@@ -932,9 +946,9 @@ class EpisodePage(Adw.NavigationPage):
         if not selected:
             self.window.toasts.add_toast(Adw.Toast(title="Select at least one episode."))
             return
-        folder = self.window.backend.library_path(self.anime, selected[0], LIBRARY_DIR).parent
-        folder.mkdir(parents=True, exist_ok=True)
-        write_sidecar(folder, self.info)
+        root = self.window.backend.library_root(self.anime, LIBRARY_DIR)
+        root.mkdir(parents=True, exist_ok=True)
+        write_sidecar(root, self.info)
         for ep in selected:
             self.window.manager.enqueue(self.anime, ep)
 
