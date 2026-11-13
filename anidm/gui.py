@@ -193,7 +193,9 @@ class LibraryView(Gtk.Box):                                      # ← new class
         title.set_width_chars(18)
         title.set_valign(Gtk.Align.START)
 
-        sub = Gtk.Label(label=f"{count} episode{'s' if count != 1 else ''}")
+        is_movie = path.parent.name == "Movies"
+        sub_text = "Movie" if is_movie else f"{count} episode{'s' if count != 1 else ''}"
+        sub = Gtk.Label(label=sub_text)
         sub.add_css_class("dim-label")
         sub.add_css_class("caption")
 
@@ -230,6 +232,7 @@ class AniDmWindow(Adw.ApplicationWindow):
 
         self.anilist = AniListClient()
         self.backend = AnimepaheBackend()
+        self.backend.cleanup_temp()
         threading.Thread(target=self.backend.warm_clearance, daemon=True).start()
         threading.Thread(target=self._refresh_catalog_if_stale, daemon=True).start()
         self.cover_pool = ThreadPoolExecutor(max_workers=12)
@@ -636,7 +639,10 @@ class AniDmApp(Adw.Application):
 
     def _load_css(self):
         provider = Gtk.CssProvider()
-        provider.load_from_string(".cover { border-radius: 12px; }")
+        provider.load_from_string(
+            ".cover { border-radius: 12px; }"
+            ".ep-divider { background-color: alpha(currentColor, 0.4); }"
+        )
         Gtk.StyleContext.add_provider_for_display(
             Gdk.Display.get_default(),
             provider,
@@ -769,8 +775,14 @@ class EpisodePage(Adw.NavigationPage):
             GObject.BindingFlags.SYNC_CREATE
         )
 
-        self.list_spinner = Gtk.Spinner()
-        self.list_spinner.set_margin_top(12)
+        self.list_spinner = Adw.Spinner()
+        self.list_spinner.set_size_request(32, 32)
+        self.list_spinner.set_halign(Gtk.Align.CENTER)
+        self.list_spinner.set_margin_top(24)
+        self.list_spinner.set_margin_bottom(24)
+
+        self.list_divider = Gtk.Separator()
+        self.list_divider.add_css_class("ep-divider")
 
         self.listbox = Gtk.ListBox()
         self.listbox.set_selection_mode(Gtk.SelectionMode.NONE)
@@ -784,6 +796,7 @@ class EpisodePage(Adw.NavigationPage):
         content.append(detail_row)
         content.append(self.synopsis)
         content.append(self.more_btn)
+        content.append(self.list_divider)
         content.append(self.list_spinner)
         content.append(self.listbox)
 
@@ -803,7 +816,7 @@ class EpisodePage(Adw.NavigationPage):
         self.set_child(toolbar)
 
         self.stack.set_visible_child_name("list")
-        self.list_spinner.start()
+        self.list_spinner.set_visible(True)
         if anime is not None:
             threading.Thread(target=self._load_chosen, args=(anime,), daemon=True).start()
         else:
@@ -927,12 +940,12 @@ class EpisodePage(Adw.NavigationPage):
             row._play_btn = play_btn
             row._menu_dl = False
             self.listbox.append(row)
-        self.list_spinner.stop()
+        self.list_spinner.set_visible(False)
         self.download_btn.set_sensitive(True)
         self.refresh_download_states()
 
     def _on_error(self, message):
-        self.list_spinner.stop()
+        self.list_spinner.set_visible(False)
         self.match_label.set_text(f"Couldn't load episodes: {message}")
 
     def _rows(self):
@@ -991,7 +1004,7 @@ class EpisodePage(Adw.NavigationPage):
 
     def load_from_anime(self, anime):
         self.anime = anime
-        self.list_spinner.start()
+        self.list_spinner.set_visible(True)
         self._clear_list()
         threading.Thread(target=self._load_chosen, args=(anime,), daemon=True).start()
 

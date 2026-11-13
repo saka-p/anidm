@@ -1,4 +1,5 @@
 import json
+import time
 import urllib.request
 import urllib.error
 from pathlib import Path
@@ -47,3 +48,26 @@ def refresh_config(config_path):
     config_path = Path(config_path)
     config_path.write_text(json.dumps({"cf": cf, "ua": ua}, indent=2) + "\n")
     return cf, ua
+
+
+
+CLEARANCE_CACHE = Path.home() / ".cache" / "ani-dm" / "clearance.json"
+CLEARANCE_MAX_AGE = 2 * 3600
+
+
+def save_clearance(cf, ua):
+    try:
+        CLEARANCE_CACHE.parent.mkdir(parents=True, exist_ok=True)
+        CLEARANCE_CACHE.write_text(json.dumps({"cf": cf, "ua": ua, "saved": time.time()}))
+    except Exception:
+        pass
+
+
+def load_clearance():
+    try:
+        data = json.loads(CLEARANCE_CACHE.read_text())
+        if time.time() - data.get("saved", 0) > CLEARANCE_MAX_AGE:
+            return None
+        return data["cf"], data["ua"]
+    except Exception:
+        return None

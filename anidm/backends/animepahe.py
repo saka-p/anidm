@@ -8,7 +8,7 @@ from pathlib import Path
 from curl_cffi import requests
 
 from .base import Anime, Episode, Backend
-from ..clearance import fetch_clearance, refresh_config
+from ..clearance import fetch_clearance, refresh_config, load_clearance, save_clearance
 from .. import flaresolverr
 from .. import meta
 
@@ -50,12 +50,24 @@ class AnimepaheBackend(Backend):
         with self._mint_lock:
             if self._creds is not None and not force:
                 return self._creds
+        if not force:
+            cached = load_clearance()
+            if cached:
+                self._creds = cached
+                return self._creds
 
-            cf, ua = fetch_clearance()
-            self._creds = (cf, ua)
-            return self._creds
+
+        cf, ua = fetch_clearance()
+        self._creds = (cf, ua)
+        save_clearance(cf, ua)
+        return self._creds
 
     def warm_clearance(self):
+        cached = load_clearance()
+        if cached:
+            self._creds = cached
+            print("WARM: using cached cookie")
+            return
         if not flaresolverr.wait_until_ready():
             print("WARM: flaresolverr never became reachable")
             return
@@ -196,7 +208,19 @@ class AnimepaheBackend(Backend):
         shutil.move(str(produced), str(final))
         shutil.rmtree(source_folder, ignore_errors=True)
         return str(final) 
-    
+
+    @staticmethod
+    def cleanup_temp():
+        try:
+            leftovers = list(SCRIPT_DIR.rglob("*.part")) + list(SCRIPT_DIR.rglob("*.ytdl"))
+            for f in leftovers:
+                f.unlink(missing_ok=True)
+            for d in SCRIPT_DIR.iterdir():
+                if d.is_dir() and not any(d.iterdir()):
+                    d.rmdir()
+        except Exception:
+            pass
+
     @staticmethod
     def library_root(anime, dest_dir):
         m = meta.get_by_title(anime.title)
